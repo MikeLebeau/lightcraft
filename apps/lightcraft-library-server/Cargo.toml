@@ -1,0 +1,23 @@
+[package]
+name = "lightcraft-library-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Experimental HTTP storage service for a shared LightCraft Web library"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lightcraft-library-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+lightcraft-preview = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }

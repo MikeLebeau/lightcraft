@@ -5,6 +5,7 @@ plan/
 /dist
 /corpus
 /log
+/apps/lightcraft-library-server/.env
 .DS_Store
 .claude/
 /craft-fonts

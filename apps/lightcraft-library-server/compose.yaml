@@ -1,0 +1,20 @@
+services:
+  lightcraft-library-server:
+    # DS218+ is x86_64; keep images built on an ARM development machine compatible.
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: apps/lightcraft-library-server/Dockerfile
+    image: lightcraft-library-server:poc
+    container_name: lightcraft-library-server
+    restart: unless-stopped
+    environment:
+      LIGHTCRAFT_BIND: 0.0.0.0:8090
+      LIGHTCRAFT_DATA_DIR: /data
+      LIGHTCRAFT_API_TOKEN: ${LIGHTCRAFT_API_TOKEN:?Set a private token of at least 32 characters}
+      LIGHTCRAFT_ALLOWED_ORIGIN: ${LIGHTCRAFT_ALLOWED_ORIGIN:?Set the exact HTTPS origin serving LightCraft Web}
+      LIGHTCRAFT_LEASE_SECONDS: 45
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ${LIGHTCRAFT_DATA_PATH:?Set a dedicated NAS folder for the PoC}:/data

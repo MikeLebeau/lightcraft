@@ -118,6 +118,12 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = "0.3"
 
+# shared-library PoC service
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1.26", features = ["v4"] }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
