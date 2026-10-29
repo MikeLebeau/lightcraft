@@ -54,17 +54,14 @@ thread_local! {
 }
 
 /// Entry point of a render worker (called by `worker.js` after instantiating the module).
-/// `store` is the backend kind the page uses ("opfs", "idb" or "memory").
+/// `store` is the backend configuration the page uses (local kind or same-tab remote lease).
 #[wasm_bindgen]
 pub fn worker_main(store: String) {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     // The main thread sends jobs only after "ready", i.e. once storage is open, and one at a time.
     wasm_bindgen_futures::spawn_local(async move {
-        let backend = match store.as_str() {
-            "memory" => None,
-            _ => Backend::open(store == "idb").await.map_err(|e| log::warn!("render worker: no storage ({e})")).ok(),
-        };
+        let backend = Backend::open_worker(&store).await.map_err(|e| log::warn!("render worker: no storage ({e})")).ok().flatten();
         let s = scope.clone();
         let onmessage = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
             let (s, b) = (s.clone(), backend.clone());

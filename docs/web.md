@@ -93,10 +93,10 @@ are the same in every version, so serve them with `Cache-Control: no-cache` (not
     the background within a frame or two, each file replaced atomically, in modification order
     (`apps/lightcraft-web/src/files.rs`). View state and UI prefs are saved every second when they
     change (a tab can close without notice).
-  - Known limitation: the browser storage has no file locks, so two tabs of the same origin open
-    the same library and the last one to write a snapshot wins (the desktop app and the CLI lock
-    a library folder: `catalog.lock`, issue #99). Use one tab at a time; a guard through the Web
-    Locks API (`navigator.locks`) is still to do.
+  - The page holds a Web Lock (`navigator.locks`, `lightcraft-library`) when the browser supports
+    it, so another tab of the same origin is refused. This is a browser-local guard: it does not
+    coordinate other devices. Browsers without Web Locks, or that refuse the request, start without
+    that guard.
   - `originals/<content hash>`: the bytes of every imported photo. The catalog refers to them as
     `web/<hash>/<file name>`; the main thread keeps recently used originals in memory (≤ 768 MB)
     and loads the rest on demand (the active photo is prefetched).
@@ -130,10 +130,9 @@ are the same in every version, so serve them with `Cache-Control: no-cache` (not
     thumbnails instead of deleting them as unindexed.
   - A picked or dropped photo whose bytes can't be stored is not added (it would be gone after
     a reload); a notice says why.
-  - One tab at a time: the page holds a Web Lock (`navigator.locks`, `lightcraft-library`); a
-    second tab or window shows "LightCraft is already open in another tab" instead of loading
-    its own copy (two copies would overwrite each other's saves). Browsers without Web Locks, or
-    that refuse the lock request, aren't protected: the app starts without the guard.
+  - One tab at a time per browser origin: the page holds a Web Lock (`navigator.locks`,
+    `lightcraft-library`); a second tab or window shows "LightCraft is already open in another tab"
+    instead of loading its own copy. This lock does not coordinate other devices.
   - If the stored library can't be opened, a notice says the session is temporary and nothing
     is saved; the stored library is left as it was.
   - A panic (wasm is built with `panic = "abort"`) replaces the page with a message saying the
@@ -166,6 +165,30 @@ are the same in every version, so serve them with `Cache-Control: no-cache` (not
   changes are not yet written to browser storage (`LightcraftApp::page_title`). eframe's web runner
   ignores the window title the desktop app sets, and a host that embeds the page reads this title to
   tell which photo a drop opened and whether it is saved (issue #2397).
+
+## Shared-library PoC (experimental)
+
+The browser can opt into the companion service with `?remote=http://127.0.0.1:8090` during local
+development, or an HTTPS service URL in a deployment. The page prompts for the service token; do
+not put it in the URL. Remote mode stores catalog files, originals and related files on the
+server, while the default remains OPFS/IndexedDB. `?reset` is disabled in remote mode.
+
+The server grants one edit lease at a time and rejects writes from expired leases. When another
+browser asks to edit, the current page receives a handoff request, blocks editing, flushes its
+pending writes, and acknowledges before the server transfers the lease. If it does not answer
+within 30 seconds, the requester can explicitly force takeover after a warning; changes not yet
+saved by the old page may then be lost. The server atomically replaces catalog files and checks
+expected offsets when extending `catalog.log`. The page renews the lease while open and attempts
+to release it when closing; after a crash, the lease expires.
+This is single-editor access, not simultaneous editing or conflict merging. Remote rendering uses
+one Web Worker by default so RAW decode and develop work do not block the browser UI; `?workers=2`
+can be used to compare a second worker, and `?workers=0` disables them. The workers reuse the page's
+lease and API credentials. If a lease renewal fails, a reconnect icon appears in the top bar. It
+retries the current lease and resumes saving only if that same lease is still valid; if it expired
+or another editor took over, the page remains frozen so it cannot overwrite newer catalog data.
+Keep unsaved changes in the tab until the connection is restored. Use only disposable test data and see
+[`apps/lightcraft-library-server/README.md`](../apps/lightcraft-library-server/README.md) for the
+local workflow and Synology deployment notes.
 
 ## Not yet
 

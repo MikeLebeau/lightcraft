@@ -38,9 +38,11 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             // traffic lights' room, and full screen gives that room back. Centring on `full` moved
             // the field, and changed its width, every time that room changed (issue #2365).
             let bar = Rect::from_min_max(pos2(full.left() - left as f32, full.top()), pos2(full.right() + 12.0, full.bottom()));
-            // The field stops short of the filter icon and the seven icons on the right; centred,
+            // The field stops short of the filter icon and the icons on the right; centred,
             // it is twice the room between the window's centre and them.
-            let mut sw = 640.0f32.min(2.0 * (full.right() - 310.0 - bar.center().x)).max(190.0);
+            let reconnect = app.services.remote_reconnect.as_ref().is_some_and(|r| (r.available)());
+            let right_reserve = if reconnect { 350.0 } else { 310.0 };
+            let mut sw = 640.0f32.min(2.0 * (full.right() - right_reserve - bar.center().x)).max(190.0);
             if !app.native_menu {
                 // leave room for the in-window menus left of the (centred) search field
                 let menus_right = full.left() + 140.0 + crate::menubar::bar_width(ui) + 24.0;
@@ -171,20 +173,26 @@ fn right_icons(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, full: Rec
         Some(sc) => format!("{} ({})", crate::i18n::tr("Import Photos…"), crate::menubar::shortcut_text(sc, mac)),
         None => crate::i18n::tr("Import Photos…").to_string(),
     };
-    for (id, icon, tip, cmd) in [
+    let mut icons = vec![
         ("discord", Icon::Chat, "Join the ArtCraft community on Discord", "app.discord"),
         ("cloud", Icon::Cloud, cloud_tip, ""),
         ("help", Icon::Help, "Keyboard shortcuts", "app.shortcuts"),
         ("share", Icon::Share, "Export", "dialog.export"),
         ("import", Icon::Plus, import_tip.as_str(), "file.addPhotos"),
         ("bell", Icon::Bell, "Activity", "panel.activity"),
-    ] {
+    ];
+    if app.services.remote_reconnect.as_ref().is_some_and(|r| (r.available)()) {
+        icons.insert(2, ("reconnect", Icon::Rotate, "Reconnect to shared library", ""));
+    }
+    for (id, icon, tip, cmd) in icons {
         let r = Rect::from_center_size(pos2(x, full.center().y), vec2(28.0, 28.0));
+        let reconnect_busy = id == "reconnect" && app.services.remote_reconnect.as_ref().is_some_and(|r| (r.busy)());
+        let tip = if reconnect_busy { "Reconnecting to shared library…" } else { tip };
         let resp = ui.interact(r, egui::Id::unique(("top", id)), Sense::click()).on_hover_text(crate::i18n::tr(tip));
         crate::widgets::announce(&resp, crate::i18n::tr(tip));
         register(ui, format!("icon:{id}"), r);
         let warn = id == "cloud" && unsaved.is_some();
-        let colour = if warn {
+        let colour = if warn || (id == "reconnect" && !reconnect_busy) {
             t.caution
         } else if resp.hovered() {
             t.text
@@ -199,11 +207,19 @@ fn right_icons(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, full: Rec
             register(ui, "indicator:unsaved", r);
         }
         // a refusal says why (Import while a Lightroom catalog is coming in)
-        if resp.clicked()
-            && !cmd.is_empty()
-            && let Err(e) = app.run(cmd, json!({}))
-        {
-            app.toast_error(ui.ctx(), e);
+        if resp.clicked() {
+            if id == "reconnect" {
+                if !reconnect_busy {
+                    let result = app.services.remote_reconnect.as_mut().map(|reconnect| (reconnect.run)(&mut app.session));
+                    if let Some(Err(error)) = result {
+                        app.toast_error(ui.ctx(), error);
+                    }
+                }
+            } else if !cmd.is_empty()
+                && let Err(e) = app.run(cmd, json!({}))
+            {
+                app.toast_error(ui.ctx(), e);
+            }
         }
         x -= 40.0;
     }

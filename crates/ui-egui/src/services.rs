@@ -43,6 +43,16 @@ pub type CheckEditorFn = Box<dyn Fn(&str) -> Result<(), String>>;
 /// storage); the work may finish asynchronously.
 pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
 
+/// A host action for a remote library that can be retried after its connection is lost.
+pub struct RemoteReconnect {
+    /// Whether the action should be shown in the host's toolbar.
+    pub available: Box<dyn Fn() -> bool>,
+    /// Whether a reconnect attempt is already running.
+    pub busy: Box<dyn Fn() -> bool>,
+    /// Try to restore the existing remote lease without discarding in-memory edits.
+    pub run: Box<dyn FnMut(&mut Session) -> Result<(), String>>,
+}
+
 /// The system's dark/light appearance where egui doesn't report one (Linux desktops whose
 /// windowing layer says nothing, e.g. many Wayland compositors). The host answers from what it
 /// last heard and wakes the UI itself when that changes; it is never polled for changes.
@@ -127,6 +137,8 @@ pub struct Services {
     pub backup_library: Option<HostAction>,
     /// File ▸ Restore Library from Backup… (web only; keeps the current library).
     pub restore_library: Option<HostAction>,
+    /// Web only: retry the active remote-library connection after a lease renewal fails.
+    pub remote_reconnect: Option<RemoteReconnect>,
     /// The system appearance for Appearance Mode ▸ Auto, ahead of egui's own report.
     pub system_theme: Option<SystemThemeFn>,
 }

@@ -1,13 +1,16 @@
 //! Browser storage, asynchronous: OPFS (Origin Private File System) when the page can write it
-//! from the main thread (`FileSystemFileHandle.createWritable`), else IndexedDB. Used from the
-//! window and from render workers alike. Keys are `/`-separated paths (OPFS directories; plain
-//! IndexedDB keys).
+//! from the main thread (`FileSystemFileHandle.createWritable`), else IndexedDB. Both local
+//! backends are used from the window and render workers. The experimental remote backend can be
+//! used by both, sharing the window's exclusive edit lease through worker initialization.
 
 use js_sys::{Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions, IdbDatabase};
+use web_sys::{
+    FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions, Headers, IdbDatabase, Request,
+    RequestInit, Response,
+};
 
 const IDB_NAME: &str = "lightcraft";
 const IDB_STORE: &str = "files";
@@ -16,10 +19,159 @@ const IDB_STORE: &str = "files";
 pub enum Backend {
     Opfs(FileSystemDirectoryHandle),
     Idb(IdbDatabase),
+    Remote(RemoteBackend),
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct RemoteBackend {
+    api: String,
+    api_token: String,
+    lease: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseReply {
+    lease: String,
+}
+
+#[derive(serde::Deserialize)]
+struct HandoffId {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct HandoffStatus {
+    state: String,
+    lease: Option<String>,
 }
 
 fn err(e: JsValue) -> String {
     e.as_string().or_else(|| e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message()))).unwrap_or_else(|| format!("{e:?}"))
+}
+
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
+async fn fetch_bytes(
+    method: &str,
+    url: &str,
+    api_token: &str,
+    lease: Option<&str>,
+    offset: Option<usize>,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), String> {
+    let headers = Headers::new().map_err(err)?;
+    headers.set("Authorization", &format!("Bearer {api_token}")).map_err(err)?;
+    if let Some(lease) = lease {
+        headers.set("X-LightCraft-Lease", lease).map_err(err)?;
+    }
+    if let Some(offset) = offset {
+        headers.set("X-LightCraft-Offset", &offset.to_string()).map_err(err)?;
+    }
+    let init = RequestInit::new();
+    init.set_method(method);
+    init.set_headers(headers.as_ref());
+    if let Some(body) = body {
+        init.set_body(&Uint8Array::from(body).into());
+    }
+    let request = Request::new_with_str_and_init(url, &init).map_err(err)?;
+    let global = js_sys::global();
+    let fetch = Reflect::get(&global, &"fetch".into()).map_err(err)?.dyn_into::<js_sys::Function>().map_err(err)?;
+    let promise = fetch.call1(&global, &request).map_err(err)?.dyn_into::<js_sys::Promise>().map_err(err)?;
+    let response: Response = JsFuture::from(promise).await.map_err(err)?.dyn_into().map_err(err)?;
+    let status = response.status();
+    let bytes = JsFuture::from(response.array_buffer().map_err(err)?).await.map_err(err)?;
+    Ok((status, Uint8Array::new(&bytes).to_vec()))
+}
+
+fn check_status(status: u16, body: &[u8]) -> Result<(), String> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(body);
+        Err(format!("shared storage returned HTTP {status}: {detail}"))
+    }
+}
+
+impl RemoteBackend {
+    fn path_url(&self, path: &str) -> String {
+        format!("{}/files/{}", self.api, path.split('/').map(encode_component).collect::<Vec<_>>().join("/"))
+    }
+
+    async fn request(&self, method: &str, url: &str, offset: Option<usize>, body: Option<&[u8]>) -> Result<(u16, Vec<u8>), String> {
+        fetch_bytes(method, url, &self.api_token, Some(&self.lease), offset, body).await
+    }
+
+    async fn acquire(api: String, api_token: String) -> Result<RemoteBackend, String> {
+        let (status, bytes) = fetch_bytes("POST", &format!("{api}/lease"), &api_token, None, None, None).await?;
+        check_status(status, &bytes)?;
+        Self::from_lease_reply(api, api_token, &bytes)
+    }
+
+    fn from_lease_reply(api: String, api_token: String, bytes: &[u8]) -> Result<RemoteBackend, String> {
+        let reply: LeaseReply = serde_json::from_slice(bytes).map_err(|e| format!("invalid lease response: {e}"))?;
+        if reply.lease.is_empty() {
+            return Err("shared storage returned an empty lease".into());
+        }
+        Ok(RemoteBackend { api, api_token, lease: reply.lease })
+    }
+
+    async fn renew(&self) -> Result<(), String> {
+        let (status, bytes) = self.request("POST", &format!("{}/lease/renew", self.api), None, None).await?;
+        check_status(status, &bytes)
+    }
+
+    async fn release(&self) -> Result<(), String> {
+        let (status, bytes) = fetch_bytes("DELETE", &format!("{}/lease", self.api), &self.api_token, Some(&self.lease), None, None).await?;
+        check_status(status, &bytes)
+    }
+
+    async fn request_handoff(&self) -> Result<String, String> {
+        let (status, bytes) = fetch_bytes("POST", &format!("{}/lease/handoff", self.api), &self.api_token, None, None, None).await?;
+        check_status(status, &bytes)?;
+        serde_json::from_slice::<HandoffId>(&bytes).map(|reply| reply.id).map_err(|e| format!("invalid handoff response: {e}"))
+    }
+
+    async fn pending_handoff(&self) -> Result<Option<String>, String> {
+        let (status, bytes) = self.request("GET", &format!("{}/lease/handoff/pending", self.api), None, None).await?;
+        check_status(status, &bytes)?;
+        serde_json::from_slice::<Option<HandoffId>>(&bytes)
+            .map(|reply| reply.map(|reply| reply.id))
+            .map_err(|e| format!("invalid pending handoff response: {e}"))
+    }
+
+    async fn acknowledge_handoff(&self, id: &str) -> Result<(), String> {
+        let (status, bytes) = self.request("POST", &format!("{}/lease/handoff/{id}/ack", self.api), None, None).await?;
+        check_status(status, &bytes)
+    }
+
+    async fn handoff_status(&self, id: &str) -> Result<HandoffStatus, String> {
+        let (status, bytes) = fetch_bytes("GET", &format!("{}/lease/handoff/{id}", self.api), &self.api_token, None, None, None).await?;
+        check_status(status, &bytes)?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid handoff status: {e}"))
+    }
+
+    async fn cancel_handoff(&self, id: &str) -> Result<(), String> {
+        let (status, bytes) = fetch_bytes("POST", &format!("{}/lease/handoff/{id}/cancel", self.api), &self.api_token, None, None, None).await?;
+        check_status(status, &bytes)
+    }
+
+    async fn takeover(&self) -> Result<RemoteBackend, String> {
+        let (status, bytes) = fetch_bytes("POST", &format!("{}/lease/takeover", self.api), &self.api_token, None, None, None).await?;
+        check_status(status, &bytes)?;
+        Self::from_lease_reply(self.api.clone(), self.api_token.clone(), &bytes)
+    }
 }
 
 /// Did an OPFS call fail because the entry doesn't exist (`NotFoundError`)? Any other failure
@@ -105,6 +257,161 @@ impl Backend {
         Self::open_idb().await
     }
 
+    /// Open the experimental server backend and acquire the library's exclusive edit lease.
+    pub async fn open_remote(base_url: &str, api_token: String) -> Result<Backend, String> {
+        let api = Self::remote_api(base_url, &api_token)?;
+        Ok(Backend::Remote(RemoteBackend::acquire(api, api_token).await?))
+    }
+
+    pub fn from_remote_lease(api: String, api_token: String, lease: String) -> Result<Backend, String> {
+        if lease.is_empty() || api_token.len() < 32 {
+            return Err("incomplete shared-library lease credentials".into());
+        }
+        Ok(Backend::Remote(RemoteBackend { api, api_token, lease }))
+    }
+
+    pub async fn request_remote_handoff(base_url: &str, api_token: String) -> Result<(String, String), String> {
+        let api = Self::remote_api(base_url, &api_token)?;
+        let remote = RemoteBackend { api: api.clone(), api_token, lease: String::new() };
+        let id = remote.request_handoff().await?;
+        Ok((api, id))
+    }
+
+    pub async fn remote_handoff_status(api: &str, api_token: &str, id: &str) -> Result<Option<String>, String> {
+        let remote = RemoteBackend { api: api.to_string(), api_token: api_token.to_string(), lease: String::new() };
+        let status = remote.handoff_status(id).await?;
+        match status.state.as_str() {
+            "pending" | "expired" => Ok(None),
+            "complete" => status.lease.filter(|lease| !lease.is_empty()).map(Some).ok_or("handoff completed without a lease".into()),
+            _ => Err(format!("unknown handoff state: {}", status.state)),
+        }
+    }
+
+    pub async fn cancel_remote_handoff(api: &str, api_token: &str, id: &str) -> Result<(), String> {
+        let remote = RemoteBackend { api: api.to_string(), api_token: api_token.to_string(), lease: String::new() };
+        remote.cancel_handoff(id).await
+    }
+
+    pub async fn take_over_remote(base_url: &str, api_token: String) -> Result<Backend, String> {
+        let api = Self::remote_api(base_url, &api_token)?;
+        let remote = RemoteBackend { api, api_token, lease: String::new() };
+        Ok(Backend::Remote(remote.takeover().await?))
+    }
+
+    pub fn handoff_context(&self) -> Result<(String, String), String> {
+        match self {
+            Backend::Remote(remote) => Ok((remote.api.clone(), remote.api_token.clone())),
+            _ => Err("this library is not using the shared service".into()),
+        }
+    }
+
+    pub async fn request_control_handoff(&self) -> Result<String, String> {
+        match self {
+            Backend::Remote(remote) => remote.request_handoff().await,
+            _ => Err("this library is not using the shared service".into()),
+        }
+    }
+
+    pub fn handoff_config(&self, lease: String) -> Result<String, String> {
+        let Backend::Remote(remote) = self else { return Err("this library is not using the shared service".into()) };
+        if lease.is_empty() {
+            return Err("handoff returned an empty lease".into());
+        }
+        serde_json::to_string(&RemoteBackend { api: remote.api.clone(), api_token: remote.api_token.clone(), lease })
+            .map_err(|e| format!("couldn't save handoff credentials: {e}"))
+    }
+
+    pub async fn force_takeover_config(&self) -> Result<String, String> {
+        let Backend::Remote(remote) = self else { return Err("this library is not using the shared service".into()) };
+        let new_lease = remote.takeover().await?;
+        serde_json::to_string(&new_lease).map_err(|e| format!("couldn't save the new lease: {e}"))
+    }
+
+    pub fn open_handoff_config(base_url: &str, config: &str) -> Result<Backend, String> {
+        let expected_api = format!("{}/v1", base_url.trim_end_matches('/'));
+        let remote: RemoteBackend = serde_json::from_str(config).map_err(|e| format!("invalid handoff credentials: {e}"))?;
+        if remote.api != expected_api || remote.api_token.len() < 32 || remote.lease.is_empty() {
+            return Err("handoff credentials do not match the configured shared library".into());
+        }
+        Ok(Backend::Remote(remote))
+    }
+
+    fn remote_api(base_url: &str, api_token: &str) -> Result<String, String> {
+        let base = base_url.trim_end_matches('/');
+        let local_http = base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:");
+        if !(base.starts_with("https://") || local_http) {
+            return Err("shared storage requires HTTPS, except for development on localhost".into());
+        }
+        if base.contains('?') || base.contains('#') || api_token.len() < 32 {
+            return Err("invalid shared storage URL or access token".into());
+        }
+        Ok(format!("{base}/v1"))
+    }
+
+    /// Configuration sent only to same-origin render workers. Remote workers reuse this tab's
+    /// lease; they must not acquire their own lease because the library is single-editor.
+    pub fn worker_config(&self) -> Result<String, String> {
+        match self {
+            Backend::Remote(remote) => serde_json::to_string(remote).map_err(|e| format!("couldn't configure remote render worker: {e}")),
+            Backend::Opfs(_) => Ok("opfs".into()),
+            Backend::Idb(_) => Ok("idb".into()),
+        }
+    }
+
+    /// Open a backend inside a render worker using the window's configuration and lease.
+    pub async fn open_worker(config: &str) -> Result<Option<Backend>, String> {
+        if config == "memory" {
+            return Ok(None);
+        }
+        if config.starts_with('{') {
+            let remote: RemoteBackend = serde_json::from_str(config).map_err(|e| format!("invalid shared worker configuration: {e}"))?;
+            if !remote.api.starts_with("https://") && !remote.api.starts_with("http://127.0.0.1:") && !remote.api.starts_with("http://localhost:") {
+                return Err("invalid shared worker service URL".into());
+            }
+            if remote.api_token.len() < 32 || remote.lease.is_empty() {
+                return Err("incomplete shared worker credentials".into());
+            }
+            return Ok(Some(Backend::Remote(remote)));
+        }
+        match config {
+            "opfs" => Self::open(false).await.map(Some),
+            "idb" => Self::open(true).await.map(Some),
+            _ => Err("unknown browser storage configuration for render worker".into()),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Backend::Remote(_))
+    }
+
+    pub async fn renew_lease(&self) -> Result<(), String> {
+        match self {
+            Backend::Remote(remote) => remote.renew().await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn pending_handoff(&self) -> Result<Option<String>, String> {
+        match self {
+            Backend::Remote(remote) => remote.pending_handoff().await,
+            _ => Ok(None),
+        }
+    }
+
+    pub async fn acknowledge_handoff(&self, id: &str) -> Result<(), String> {
+        match self {
+            Backend::Remote(remote) => remote.acknowledge_handoff(id).await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn release_lease(&self) -> Result<(), String> {
+        match self {
+            Backend::Remote(remote) => remote.release().await,
+            _ => Ok(()),
+        }
+    }
+
     async fn open_idb() -> Result<Backend, String> {
         let f = indexed_db().ok_or("no IndexedDB")?;
         let req = f.open_with_u32(IDB_NAME, 1).map_err(err)?;
@@ -127,6 +434,7 @@ impl Backend {
         match self {
             Backend::Opfs(_) => "opfs",
             Backend::Idb(_) => "idb",
+            Backend::Remote(_) => "remote",
         }
     }
 
@@ -168,6 +476,15 @@ impl Backend {
     /// A whole file, or `None` if it doesn't exist.
     pub async fn read(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
+            Backend::Remote(remote) => {
+                let (status, bytes) = remote.request("GET", &remote.path_url(path), None, None).await?;
+                if status == 404 {
+                    Ok(None)
+                } else {
+                    check_status(status, &bytes)?;
+                    Ok(Some(bytes))
+                }
+            }
             Backend::Opfs(root) => {
                 let Some(h) = Self::opfs_file(root, path, false).await? else { return Ok(None) };
                 let file: web_sys::File = JsFuture::from(h.get_file()).await.map_err(err)?.unchecked_into();
@@ -193,6 +510,14 @@ impl Backend {
     /// Write `data` at `offset` keeping the bytes before it (`None`: replace the file). Atomic.
     pub async fn write_at(&self, path: &str, offset: Option<usize>, data: &[u8]) -> Result<(), String> {
         match self {
+            Backend::Remote(remote) => {
+                let (method, offset) = match offset {
+                    Some(offset) => ("PATCH", Some(offset)),
+                    None => ("PUT", None),
+                };
+                let (status, bytes) = remote.request(method, &remote.path_url(path), offset, Some(data)).await?;
+                check_status(status, &bytes)
+            }
             Backend::Opfs(root) => {
                 let h = Self::opfs_file(root, path, true).await?.ok_or("can't create file")?;
                 let opts = web_sys::FileSystemCreateWritableOptions::new();
@@ -238,6 +563,15 @@ impl Backend {
     /// Is there a file at `path`?
     pub async fn exists(&self, path: &str) -> Result<bool, String> {
         match self {
+            Backend::Remote(remote) => {
+                let (status, bytes) = remote.request("HEAD", &remote.path_url(path), None, None).await?;
+                if status == 404 {
+                    Ok(false)
+                } else {
+                    check_status(status, &bytes)?;
+                    Ok(true)
+                }
+            }
             Backend::Opfs(root) => Ok(Self::opfs_file(root, path, false).await?.is_some()),
             Backend::Idb(db) => {
                 let (_tx, store) = Self::idb_store(db, false)?;
@@ -249,6 +583,10 @@ impl Backend {
 
     pub async fn remove(&self, path: &str) -> Result<(), String> {
         match self {
+            Backend::Remote(remote) => {
+                let (status, bytes) = remote.request("DELETE", &remote.path_url(path), None, None).await?;
+                check_status(status, &bytes)
+            }
             Backend::Opfs(root) => {
                 let Some((dir, name)) = Self::parent(root, path, false).await? else { return Ok(()) };
                 match JsFuture::from(dir.remove_entry(&name)).await {
@@ -268,6 +606,12 @@ impl Backend {
     /// Names of the files directly inside `dir`.
     pub async fn list(&self, dir: &str) -> Result<Vec<String>, String> {
         match self {
+            Backend::Remote(remote) => {
+                let url = format!("{}/list?path={}", remote.api, encode_component(dir));
+                let (status, bytes) = remote.request("GET", &url, None, None).await?;
+                check_status(status, &bytes)?;
+                serde_json::from_slice(&bytes).map_err(|e| format!("invalid shared storage directory listing: {e}"))
+            }
             Backend::Opfs(root) => {
                 // `parent` of a child path is `dir` itself
                 let Some((handle, _)) = Self::parent(root, &format!("{dir}/-"), false).await? else { return Ok(Vec::new()) };
@@ -291,6 +635,7 @@ impl Backend {
     /// Delete everything (the "reset" escape hatch: `?reset` in the URL).
     pub async fn clear(&self) -> Result<(), String> {
         match self {
+            Backend::Remote(_) => Err("clearing a shared library from the browser is disabled".into()),
             Backend::Opfs(root) => {
                 for name in dir_keys(root).await? {
                     let opts = web_sys::FileSystemRemoveOptions::new();

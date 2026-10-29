@@ -13,6 +13,7 @@ use lightcraft_ui_egui::{LightcraftApp, Services, UiState};
 use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::backend::Backend;
 use crate::backup::{ACTIVE_LIBRARY, DEFAULT_LIBRARY_DIR, valid_library_dir};
@@ -37,6 +38,23 @@ const NOTICE_SECS: f64 = 8.0;
 
 /// How often view state, UI prefs and the thumbnail index are saved (ms).
 const SAVE_EVERY_MS: f64 = 1000.0;
+const HANDOFF_SESSION_KEY: &str = "lightcraft.pending-remote-handoff";
+
+fn take_handoff_session_config() -> Option<String> {
+    let storage = window()?.session_storage().ok()??;
+    let config = storage.get_item(HANDOFF_SESSION_KEY).ok().flatten();
+    let _ = storage.remove_item(HANDOFF_SESSION_KEY);
+    config
+}
+
+fn store_handoff_session_config(config: &str) -> Result<(), String> {
+    let storage = window()
+        .ok_or("no browser window")?
+        .session_storage()
+        .map_err(|e| format!("session storage unavailable: {e:?}"))?
+        .ok_or("session storage unavailable")?;
+    storage.set_item(HANDOFF_SESSION_KEY, config).map_err(|e| format!("couldn't preserve the new lease for reload: {e:?}"))
+}
 
 /// The page's window (`None` only outside a browser page, e.g. in a worker).
 fn window() -> Option<web_sys::Window> {
@@ -54,6 +72,33 @@ fn set_status(text: &str) {
     }
 }
 
+fn set_loading(text: &str) {
+    if let Some(el) = window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("lightcraft_loading")) {
+        el.set_text_content(Some(text));
+    }
+}
+
+/// Release a shared-library lease when the page closes; the server TTL remains the crash fallback.
+fn release_remote_on_pagehide(backend: &Backend) {
+    if !backend.is_remote() {
+        return;
+    }
+    let Some(window) = window() else { return };
+    let backend = backend.clone();
+    let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        let backend = backend.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(error) = backend.release_lease().await {
+                log::debug!("shared-library lease release on page close: {error}");
+            }
+        });
+    });
+    if let Err(error) = window.add_event_listener_with_callback("pagehide", callback.as_ref().unchecked_ref()) {
+        log::debug!("couldn't register shared-library lease release: {error:?}");
+    }
+    callback.forget();
+}
+
 /// Storage key of library file `name` in library folder `dir`.
 fn library_key(dir: &str, name: &str) -> String {
     format!("{dir}/{name}")
@@ -68,13 +113,15 @@ pub(crate) fn request_repaint() {
     });
 }
 
-/// URL options (`?bench&store=idb&workers=2&reset`).
+/// URL options (`?bench&store=idb&workers=2&reset&remote=http://127.0.0.1:8090`).
 struct Options {
     bench: bool,
     /// "opfs" (default: OPFS, falling back to IndexedDB), "idb" or "memory".
     store: String,
     workers: Option<usize>,
     reset: bool,
+    /// Server base URL for opt-in shared-library mode. The access token is prompted for separately.
+    remote: Option<String>,
 }
 
 impl Options {
@@ -95,6 +142,7 @@ impl Options {
             store: get("store").filter(|s| s == "idb" || s == "memory").unwrap_or_else(|| "opfs".into()),
             workers: get("workers").and_then(|v| v.parse().ok()),
             reset: get("reset").is_some(),
+            remote: get("remote").filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -106,7 +154,7 @@ async fn store_file(originals: Originals, backend: Option<Backend>, name: String
         && let Err(e) = b.write(&storage_key(&hash), &bytes).await
     {
         // a photo whose bytes aren't stored would be gone after a reload: don't add it
-        notice(format!("{name} was not added: browser storage refused it ({e}). Free up space or back up and clear old photos."));
+        notice(format!("{name} was not added: storage refused it ({e}). Check the connection and available space."));
         return;
     }
     originals.added(&name, &hash, Arc::from(bytes));
@@ -117,7 +165,10 @@ async fn store_file(originals: Originals, backend: Option<Backend>, name: String
 async fn read_file(originals: Originals, backend: Option<Backend>, file: web_sys::File, ctx: egui::Context) {
     match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
         Ok(buf) => store_file(originals, backend, file.name(), js_sys::Uint8Array::new(&buf).to_vec(), ctx).await,
-        Err(e) => log::warn!("reading {}: {e:?}", file.name()),
+        Err(e) => {
+            log::warn!("reading {}: {e:?}", file.name());
+            notice(format!("Couldn't read {} from the browser: {e:?}", file.name()));
+        }
     }
 }
 
@@ -171,9 +222,71 @@ fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
 /// Build the browser host's `Services`: library backup/restore through browser storage and a
 /// download, asynchronous file picking, downloads for writes, and PNG encoding. Desktop-only
 /// services (native pickers, reveal, model folders) stay unset.
-fn services(originals: Originals, backend: Option<Backend>, files: Files, frozen: Rc<Cell<bool>>, ctx: egui::Context) -> Services {
+#[allow(clippy::too_many_arguments)] // The browser host wires these shared service states together.
+fn services(
+    originals: Originals,
+    backend: Option<Backend>,
+    files: Files,
+    frozen: Rc<Cell<bool>>,
+    remote_disconnected: Rc<Cell<bool>>,
+    lease_renewing: Rc<Cell<bool>>,
+    last_lease_renew: Rc<Cell<f64>>,
+    ctx: egui::Context,
+) -> Services {
     let (backup_backend, backup_files) = (backend.clone(), files);
     let restore_backend = backend.clone();
+    let remote_reconnect = backend.as_ref().filter(|b| b.is_remote()).map(|backend| {
+        let (backend, files, frozen, disconnected, renewing, last_renew, ctx) = (
+            backend.clone(),
+            backup_files.clone(),
+            frozen.clone(),
+            remote_disconnected.clone(),
+            lease_renewing.clone(),
+            last_lease_renew.clone(),
+            ctx.clone(),
+        );
+        lightcraft_ui_egui::RemoteReconnect {
+            available: Box::new({
+                let disconnected = disconnected.clone();
+                move || disconnected.get()
+            }),
+            busy: Box::new({
+                let renewing = renewing.clone();
+                move || renewing.get()
+            }),
+            run: Box::new(move |_session| {
+                if !disconnected.get() || renewing.replace(true) {
+                    return Ok(());
+                }
+                let (backend, files, frozen, disconnected, renewing, last_renew, ctx) =
+                    (backend.clone(), files.clone(), frozen.clone(), disconnected.clone(), renewing.clone(), last_renew.clone(), ctx.clone());
+                wasm_bindgen_futures::spawn_local(async move {
+                    match backend.renew_lease().await {
+                        Ok(()) => {
+                            files.set_error(None);
+                            frozen.set(false);
+                            disconnected.set(false);
+                            last_renew.set(lightcraft_ui_egui::monotonic_ms());
+                            notice(lightcraft_ui_egui::i18n::tr("Shared library connection restored; pending changes will be saved."));
+                        }
+                        Err(error) => {
+                            files.set_error(Some(format!("shared-library edit lease lost: {error}")));
+                            frozen.set(true);
+                            disconnected.set(true);
+                            notice(format!(
+                                "{}: {error}. {}",
+                                lightcraft_ui_egui::i18n::tr("Reconnect failed"),
+                                lightcraft_ui_egui::i18n::tr("Changes remain in this tab and won't be saved until it reconnects.")
+                            ));
+                        }
+                    }
+                    renewing.set(false);
+                    ctx.request_repaint();
+                });
+                Ok(())
+            }),
+        }
+    });
     Services {
         local_places: None,
         picker: None,
@@ -214,6 +327,7 @@ fn services(originals: Originals, backend: Option<Backend>, files: Files, frozen
             safety::pick_and_restore(b, move || frozen.set(true));
             Ok(json!({"started": true}))
         })),
+        remote_reconnect,
         pick_files: Some(Box::new(move || {
             open_picker(originals.clone(), backend.clone(), ctx.clone());
             Vec::new() // files arrive asynchronously and are imported on a later frame
@@ -303,9 +417,116 @@ struct Boot {
     load_error: Option<String>,
 }
 
+async fn wait_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let callback = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        if let Some(window) = window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), ms);
+        }
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+async fn open_remote_with_handoff(base_url: &str, token: String) -> Result<Backend, String> {
+    set_loading(lightcraft_ui_egui::i18n::tr("Connecting to the shared library…"));
+    match Backend::open_remote(base_url, token.clone()).await {
+        Ok(backend) => Ok(backend),
+        Err(error) if error.contains("HTTP 409") => {
+            let question = lightcraft_ui_egui::i18n::tr("This library is active in another session. Ask it to save and hand over control?");
+            if !safety::confirm(question) {
+                return Err("shared-library handoff was cancelled".into());
+            }
+            let (api, id) = Backend::request_remote_handoff(base_url, token.clone()).await?;
+            let started = perf_now();
+            loop {
+                let remaining = ((30_000.0 - (perf_now() - started)).max(0.0) / 1000.0).ceil() as u64;
+                set_loading(&format!("{} {remaining} s", lightcraft_ui_egui::i18n::tr("Waiting for the active session to save and hand over…")));
+                match Backend::remote_handoff_status(&api, &token, &id).await {
+                    Ok(Some(lease)) => {
+                        set_loading(lightcraft_ui_egui::i18n::tr("Handoff received; loading the shared library…"));
+                        return Backend::from_remote_lease(api, token, lease);
+                    }
+                    Ok(None) if perf_now() - started < 30_000.0 => wait_ms(500).await,
+                    Ok(None) => break,
+                    Err(e) => return Err(format!("handoff request failed: {e}")),
+                }
+            }
+            let force = lightcraft_ui_egui::i18n::tr(
+                "The other session did not respond. Taking over may lose changes that it has not saved. Take over anyway?",
+            );
+            if safety::confirm(force) {
+                set_loading(lightcraft_ui_egui::i18n::tr("Taking control; loading the shared library…"));
+                Backend::take_over_remote(base_url, token).await
+            } else {
+                let _ = Backend::cancel_remote_handoff(&api, &token, &id).await;
+                Err("handoff timed out; no changes were made".into())
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn request_control_config(backend: &Backend) -> Result<String, String> {
+    let (api, token) = backend.handoff_context()?;
+    let id = match backend.request_control_handoff().await {
+        Ok(id) => id,
+        Err(error) if error.contains("no active editor") => {
+            let force = lightcraft_ui_egui::i18n::tr("No other session is active. Take control of this library here?");
+            return if safety::confirm(force) { backend.force_takeover_config().await } else { Err("control request cancelled".into()) };
+        }
+        Err(error) => return Err(error),
+    };
+    let started = perf_now();
+    loop {
+        match Backend::remote_handoff_status(&api, &token, &id).await {
+            Ok(Some(lease)) => return backend.handoff_config(lease),
+            Ok(None) if perf_now() - started < 30_000.0 => wait_ms(500).await,
+            Ok(None) => break,
+            Err(e) => return Err(format!("handoff request failed: {e}")),
+        }
+    }
+    let force =
+        lightcraft_ui_egui::i18n::tr("The active session did not respond. Taking control may lose changes it has not saved. Take control anyway?");
+    if safety::confirm(force) {
+        backend.force_takeover_config().await
+    } else {
+        let _ = Backend::cancel_remote_handoff(&api, &token, &id).await;
+        Err("handoff timed out; control was not changed".into())
+    }
+}
+
+#[allow(clippy::cognitive_complexity)] // Startup coordinates local, remote and cooperative-handoff storage paths.
 async fn boot(opts: Options) -> Boot {
     let t0 = perf_now();
-    let backend = if opts.store == "memory" {
+    let mut load_error = None;
+    let backend = if let Some(base_url) = &opts.remote {
+        if let Some(config) = take_handoff_session_config() {
+            match Backend::open_handoff_config(base_url, &config) {
+                Ok(backend) => Some(backend),
+                Err(error) => {
+                    load_error = Some(format!("couldn't resume the handed-off library: {error}"));
+                    None
+                }
+            }
+        } else {
+            let token = window().and_then(|w| w.prompt_with_message("LightCraft shared-library access token").ok().flatten());
+            match token {
+                Some(token) => match open_remote_with_handoff(base_url, token).await {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        load_error = Some(format!("couldn't connect to shared storage: {e}"));
+                        None
+                    }
+                },
+                None => {
+                    load_error = Some("shared storage connection was cancelled; nothing was opened or changed".into());
+                    None
+                }
+            }
+        }
+    } else if opts.store == "memory" {
         None
     } else {
         match Backend::open(opts.store == "idb").await {
@@ -319,9 +540,11 @@ async fn boot(opts: Options) -> Boot {
     let files = Files::default();
     let mut index = ThumbIndex::default();
     let mut lib_dir = DEFAULT_LIBRARY_DIR.to_string();
-    let mut load_error = None;
+    if opts.reset && opts.remote.is_some() {
+        load_error = Some("?reset is disabled for shared libraries".into());
+    }
     if let Some(b) = &backend {
-        if opts.reset {
+        if opts.reset && opts.remote.is_none() {
             // everything this site keeps in the browser, photos included: never without asking
             let ok = safety::confirm(
                 "?reset deletes the LightCraft library stored in this browser, including every imported photo. \
@@ -337,16 +560,18 @@ async fn boot(opts: Options) -> Boot {
             }
         }
         // a restored backup lives in its own folder (see `backup`)
-        match b.read(ACTIVE_LIBRARY).await {
-            Ok(Some(d)) => {
-                let d = String::from_utf8_lossy(&d).trim().to_string();
-                if valid_library_dir(&d) {
-                    lib_dir = d;
+        if load_error.is_none() {
+            match b.read(ACTIVE_LIBRARY).await {
+                Ok(Some(d)) => {
+                    let d = String::from_utf8_lossy(&d).trim().to_string();
+                    if valid_library_dir(&d) {
+                        lib_dir = d;
+                    }
                 }
+                Ok(None) => {}
+                // not knowing which library is in use, any library opened could be the wrong one
+                Err(e) => load_error = Some(format!("couldn't read which library is in use ({e})")),
             }
-            Ok(None) => {}
-            // not knowing which library is in use, any library opened could be the wrong one
-            Err(e) => load_error = Some(format!("couldn't read which library is in use from browser storage ({e})")),
         }
         if load_error.is_none() {
             let mut reads = Vec::new();
@@ -358,39 +583,43 @@ async fn boot(opts: Options) -> Boot {
                 load_error = Some(e);
             }
         }
-        let index_read = b.read(THUMB_INDEX).await;
-        match &index_read {
-            Ok(Some(j)) => index = ThumbIndex::from_json(j),
-            Ok(None) => {}
-            Err(e) => log::warn!("reading the thumbnail index: {e}"),
-        }
-        crate::backend::request_persistence(|granted| {
-            if !granted {
-                notice(
-                    "This browser may delete LightCraft's library when it runs short of space (persistent storage wasn't granted). \
-                     Keep your original photos elsewhere and use File ▸ Back Up Library… now and then.",
-                );
+        if load_error.is_none() {
+            let index_read = b.read(THUMB_INDEX).await;
+            match &index_read {
+                Ok(Some(j)) => index = ThumbIndex::from_json(j),
+                Ok(None) => {}
+                Err(e) => log::warn!("reading the thumbnail index: {e}"),
             }
-        });
-        // thumbnails stored without an index entry (index saved late, or lost): delete them; not
-        // when the index couldn't be read, which would make every thumbnail look unindexed
-        let b2 = b.clone();
-        let known: std::collections::HashSet<String> = b
-            .list("thumbs")
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| n.ends_with(".jpg"))
-            .map(|n| n.trim_end_matches(".jpg").to_string())
-            .collect();
-        let orphans: Vec<String> = if index_read.is_ok() { known.into_iter().filter(|k| !index.contains(k)).collect() } else { Vec::new() };
-        if !orphans.is_empty() {
-            wasm_bindgen_futures::spawn_local(async move {
-                for k in &orphans {
-                    let _ = b2.remove(&crate::wire::thumb_storage_key(k)).await;
-                }
-                log::info!("thumbnail cache: removed {} unindexed files", orphans.len());
-            });
+            if opts.remote.is_none() {
+                crate::backend::request_persistence(|granted| {
+                    if !granted {
+                        notice(
+                            "This browser may delete LightCraft's library when it runs short of space (persistent storage wasn't granted). \
+                             Keep your original photos elsewhere and use File ▸ Back Up Library… now and then.",
+                        );
+                    }
+                });
+            }
+            // thumbnails stored without an index entry (index saved late, or lost): delete them; not
+            // when the index couldn't be read, which would make every thumbnail look unindexed
+            let b2 = b.clone();
+            let known: std::collections::HashSet<String> = b
+                .list("thumbs")
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| n.ends_with(".jpg"))
+                .map(|n| n.trim_end_matches(".jpg").to_string())
+                .collect();
+            let orphans: Vec<String> = if index_read.is_ok() { known.into_iter().filter(|k| !index.contains(k)).collect() } else { Vec::new() };
+            if !orphans.is_empty() {
+                wasm_bindgen_futures::spawn_local(async move {
+                    for k in &orphans {
+                        let _ = b2.remove(&crate::wire::thumb_storage_key(k)).await;
+                    }
+                    log::info!("thumbnail cache: removed {} unindexed files", orphans.len());
+                });
+            }
         }
     }
     log::info!(
@@ -414,6 +643,14 @@ struct WebApp {
     flush_failed_at: Rc<Cell<f64>>,
     /// Saving stopped (a restored backup is about to replace this library: the page reloads).
     frozen: Rc<Cell<bool>>,
+    /// Server lease heartbeat state. Local browser backends do not use these fields.
+    last_lease_renew: Rc<Cell<f64>>,
+    lease_renewing: Rc<Cell<bool>>,
+    remote_disconnected: Rc<Cell<bool>>,
+    handoff_busy: Rc<Cell<bool>>,
+    takeback_busy: Rc<Cell<bool>>,
+    takeback_deadline: Rc<Cell<f64>>,
+    last_handoff_check: Rc<Cell<f64>>,
     lib_dir: String,
     bench: Option<Bench>,
     first_frame_logged: bool,
@@ -456,6 +693,9 @@ impl WebApp {
     /// load the stored UI state, start render workers and the optional benchmark.
     fn new(cc: &eframe::CreationContext<'_>, boot: Boot, chinese_font: Vec<u8>) -> Self {
         let Boot { opts, backend, files, index, lib_dir, load_error } = boot;
+        if let Some(backend) = &backend {
+            release_remote_on_pagehide(backend);
+        }
         let originals = Originals::default();
         let t = perf_now();
         let mut session = Session::new();
@@ -490,13 +730,15 @@ impl WebApp {
                 problem = Some(lightcraft_ui_egui::panels::library_problem::LibraryProblem {
                     can_retry: false,
                     ..lightcraft_ui_egui::panels::library_problem::LibraryProblem::new(
-                        "the browser's storage for this page",
+                        if opts.remote.is_some() { "shared storage" } else { "the browser's storage for this page" },
                         format!("{e}. Reload the page to try again."),
                     )
                 });
             }
         }
-        if backend.is_some() {
+        if backend.as_ref().is_some_and(Backend::is_remote) {
+            notice("Connected to the shared test library. Only one browser can edit it at a time; keep separate backups of original photos.");
+        } else if backend.is_some() {
             notice(
                 "LightCraft in the browser is experimental. Your library is kept in this browser's storage: keep your original photos \
                  elsewhere and back up with File ▸ Back Up Library….",
@@ -506,8 +748,27 @@ impl WebApp {
         session.media.preview_capacity = 3;
         // nothing is saved while the stored library couldn't be read
         let frozen = Rc::new(Cell::new(read_failed));
-        let mut app = LightcraftApp::new(session, services(originals.clone(), backend.clone(), files.clone(), frozen.clone(), cc.egui_ctx.clone()))
-            .with_chinese_font(chinese_font);
+        let last_lease_renew = Rc::new(Cell::new(lightcraft_ui_egui::monotonic_ms()));
+        let lease_renewing = Rc::new(Cell::new(false));
+        let remote_disconnected = Rc::new(Cell::new(false));
+        let handoff_busy = Rc::new(Cell::new(false));
+        let takeback_busy = Rc::new(Cell::new(false));
+        let takeback_deadline = Rc::new(Cell::new(0.0));
+        let last_handoff_check = Rc::new(Cell::new(0.0));
+        let mut app = LightcraftApp::new(
+            session,
+            services(
+                originals.clone(),
+                backend.clone(),
+                files.clone(),
+                frozen.clone(),
+                remote_disconnected.clone(),
+                lease_renewing.clone(),
+                last_lease_renew.clone(),
+                cc.egui_ctx.clone(),
+            ),
+        )
+        .with_chinese_font(chinese_font);
         let ui_written = files.get("ui.json").unwrap_or_default();
         // an arrangement from an older docking version starts again from the default
         let mut saved = serde_json::from_slice::<serde_json::Value>(&ui_written).unwrap_or_default();
@@ -519,22 +780,33 @@ impl WebApp {
         }
         app.ui = app.ui.sanitized();
         app.library_problem = problem;
+        let remote = backend.as_ref().is_some_and(Backend::is_remote);
         let n = opts.workers.unwrap_or_else(|| {
-            let cores = window().map_or(1, |w| w.navigator().hardware_concurrency() as usize);
-            cores.saturating_sub(1).clamp(1, 4)
+            if remote {
+                // RAW decode and develop work can be large; keep one worker by default so it
+                // leaves CPU and memory headroom while keeping the UI responsive.
+                1
+            } else {
+                let cores = window().map_or(1, |w| w.navigator().hardware_concurrency() as usize);
+                cores.saturating_sub(1).clamp(1, 4)
+            }
         });
         let cache = app.session.media.rendered.clone();
-        let workers = (n > 0).then(|| {
-            Workers::start(
-                n,
-                backend.as_ref().map_or("memory", |b| b.kind()),
-                backend.clone(),
-                index,
-                &cache,
-                app.session.cache_bytes(),
-                cc.egui_ctx.clone(),
-            )
-        });
+        let worker_config = match backend.as_ref() {
+            Some(backend) => backend.worker_config(),
+            None => Ok("memory".to_string()),
+        };
+        let workers = if n == 0 {
+            None
+        } else {
+            match worker_config {
+                Ok(config) => Some(Workers::start(n, &config, backend.clone(), index, &cache, app.session.cache_bytes(), cc.egui_ctx.clone())),
+                Err(error) => {
+                    log::warn!("lightcraft: couldn't start render workers: {error}");
+                    None
+                }
+            }
+        };
         if let Some(w) = &workers {
             app.renderer.set_offload(Box::new(w.clone()));
         }
@@ -550,6 +822,13 @@ impl WebApp {
             flushing: Rc::new(Cell::new(false)),
             flush_failed_at: Rc::new(Cell::new(0.0)),
             frozen,
+            last_lease_renew,
+            lease_renewing,
+            remote_disconnected,
+            handoff_busy,
+            takeback_busy,
+            takeback_deadline,
+            last_handoff_check,
             lib_dir,
             bench: opts.bench.then(|| Bench::new(origin)),
             first_frame_logged: false,
@@ -670,6 +949,106 @@ impl WebApp {
             wasm_bindgen_futures::spawn_local(flush(files, b.clone(), dir, flushing, failed_at));
         }
     }
+
+    fn renew_remote_lease(&mut self, ctx: &egui::Context) {
+        let Some(backend) = self.backend.as_ref().filter(|b| b.is_remote()) else { return };
+        if self.frozen.get() || self.lease_renewing.get() || self.handoff_busy.get() {
+            return;
+        }
+        let now = lightcraft_ui_egui::monotonic_ms();
+        if now - self.last_lease_renew.get() < 15_000.0 {
+            return;
+        }
+        self.lease_renewing.set(true);
+        let (backend, files, frozen, disconnected, renewing, last_renew, ctx) = (
+            backend.clone(),
+            self.files.clone(),
+            self.frozen.clone(),
+            self.remote_disconnected.clone(),
+            self.lease_renewing.clone(),
+            self.last_lease_renew.clone(),
+            ctx.clone(),
+        );
+        wasm_bindgen_futures::spawn_local(async move {
+            match backend.renew_lease().await {
+                Ok(()) => {
+                    last_renew.set(lightcraft_ui_egui::monotonic_ms());
+                    disconnected.set(false);
+                }
+                Err(error) => {
+                    files.set_error(Some(format!("shared-library edit lease lost: {error}")));
+                    frozen.set(true);
+                    disconnected.set(true);
+                    notice(
+                        "The shared-library edit lease was lost. Saving is stopped; reload only after the connection or other editor issue is resolved.",
+                    );
+                }
+            }
+            renewing.set(false);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_remote_handoff(&mut self, ctx: &egui::Context) {
+        let Some(backend) = self.backend.as_ref().filter(|backend| backend.is_remote()) else { return };
+        if self.frozen.get() || self.handoff_busy.get() || self.lease_renewing.get() {
+            return;
+        }
+        let now = lightcraft_ui_egui::monotonic_ms();
+        if now - self.last_handoff_check.get() < 2_000.0 {
+            return;
+        }
+        self.last_handoff_check.set(now);
+        self.lease_renewing.set(true);
+        let (backend, files, busy, frozen, disconnected, renewing, flushing, ctx) = (
+            backend.clone(),
+            self.files.clone(),
+            self.handoff_busy.clone(),
+            self.frozen.clone(),
+            self.remote_disconnected.clone(),
+            self.lease_renewing.clone(),
+            self.flushing.clone(),
+            ctx.clone(),
+        );
+        wasm_bindgen_futures::spawn_local(async move {
+            let request = backend.pending_handoff().await;
+            renewing.set(false);
+            let Ok(Some(id)) = request else { return };
+            busy.set(true);
+            ctx.request_repaint();
+            // Stop app logic immediately; the normal save loop drains the dirty mirror while the
+            // UI is disabled. A timeout leaves the page read-only and does not grant the lease.
+            let started = lightcraft_ui_egui::monotonic_ms();
+            loop {
+                if !flushing.get() && !files.is_dirty() && files.error().is_none() {
+                    break;
+                }
+                if lightcraft_ui_egui::monotonic_ms() - started > 30_000.0 {
+                    frozen.set(true);
+                    disconnected.set(true);
+                    notice("Couldn't save all pending changes; this session is now read-only and the handoff was not completed.");
+                    busy.set(false);
+                    ctx.request_repaint();
+                    return;
+                }
+                wait_ms(100).await;
+            }
+            match backend.acknowledge_handoff(&id).await {
+                Ok(()) => {
+                    frozen.set(true);
+                    disconnected.set(true);
+                    notice("Changes saved. Editing control was handed to the other session.");
+                }
+                Err(error) => {
+                    frozen.set(true);
+                    disconnected.set(true);
+                    notice(format!("Handoff failed after saving: {error}. This session is read-only."));
+                }
+            }
+            busy.set(false);
+            ctx.request_repaint();
+        });
+    }
 }
 
 type Reply = (js_sys::Function, js_sys::Function);
@@ -734,21 +1113,31 @@ impl eframe::App for WebApp {
             let now = self.app.tick_now();
             self.app.ui.toast = Some((text, now + NOTICE_SECS, None));
         }
-        self.run_inbox();
+        self.poll_remote_handoff(ctx);
+        self.renew_remote_lease(ctx);
+        if !self.handoff_busy.get() && !self.remote_disconnected.get() {
+            self.run_inbox();
+        }
         self.load_originals(ctx);
         if let Some(w) = &self.workers {
             // `library.preferences ▸ cacheMb` is read by the session; the worker index prunes on
             // its own thread, so it gets the budget every frame and applies it on the next store.
             w.set_budget(self.app.session.cache_bytes());
         }
-        self.app.logic(ctx);
+        if !self.handoff_busy.get() && !self.remote_disconnected.get() {
+            self.app.logic(ctx);
+        }
         self.save();
     }
 
     /// Pass the browser's raw input to the app hook before egui processes it, so prompt barriers
     /// and synthetic or dropped input are applied consistently with the desktop host.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.app.raw_input_hook(ctx, raw);
+        if !self.handoff_busy.get() && !self.remote_disconnected.get() {
+            self.app.raw_input_hook(ctx, raw);
+        }
+        // Keep pointer events for the read-only modal's buttons. App logic and synthetic input
+        // are already blocked while the lease is unavailable.
     }
 
     /// eframe's UI pass: import queued drops unless a prompt blocks input, draw the app, update the
@@ -758,8 +1147,70 @@ impl eframe::App for WebApp {
         // `import_dropped` itself takes both queues only through the gate, so a prompt or the
         // blocking library window (over an already open library) keeps a stored drop queued.
         let ctx = ui.ctx().clone();
-        self.import_dropped(&ctx);
+        let locked = self.handoff_busy.get() || self.remote_disconnected.get();
+        if !locked {
+            self.import_dropped(&ctx);
+        }
         self.app.ui(ui);
+        if locked {
+            egui::Modal::new(egui::Id::unique("shared-library-read-only")).show(&ctx, |ui| {
+                ui.heading(egui::RichText::new(lightcraft_ui_egui::i18n::tr("Shared library is read-only")).strong());
+                let message = if self.handoff_busy.get() {
+                    "Saving pending changes and handing off editing control…"
+                } else {
+                    "This session no longer has editing control. Changes here cannot be saved."
+                };
+                ui.label(lightcraft_ui_egui::i18n::tr(message));
+                if self.remote_disconnected.get() {
+                    let label = "Take control here";
+                    if self.takeback_busy.get() {
+                        let remaining = ((self.takeback_deadline.get() - lightcraft_ui_egui::monotonic_ms()).max(0.0) / 1000.0).ceil() as u64;
+                        ui.spinner();
+                        ui.label(format!("{} {remaining} s", lightcraft_ui_egui::i18n::tr("Waiting for the active session…")));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                    if !self.takeback_busy.get() && ui.button(lightcraft_ui_egui::i18n::tr(label)).clicked() {
+                        let own_changes = self.files.is_dirty();
+                        let question = if own_changes {
+                            "Ask the active session to hand over? This tab also has unsaved changes; reloading will discard them."
+                        } else {
+                            "Ask the active session to save and hand over control to this tab?"
+                        };
+                        if safety::confirm(lightcraft_ui_egui::i18n::tr(question))
+                            && let Some(backend) = self.backend.clone()
+                        {
+                            self.takeback_busy.set(true);
+                            self.takeback_deadline.set(lightcraft_ui_egui::monotonic_ms() + 30_000.0);
+                            let busy = self.takeback_busy.clone();
+                            let ctx = ctx.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                match request_control_config(&backend).await {
+                                    Ok(config) => match store_handoff_session_config(&config) {
+                                        Ok(()) => {
+                                            if let Some(window) = window()
+                                                && let Err(error) = window.location().reload()
+                                            {
+                                                notice(format!("Couldn't reload after taking control: {error:?}"));
+                                                busy.set(false);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            notice(error);
+                                            busy.set(false);
+                                        }
+                                    },
+                                    Err(error) => {
+                                        notice(error);
+                                        busy.set(false);
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                    }
+                }
+            });
+        }
         // eframe's web runner ignores `ViewportCommand::Title`: name the open photo in the page title
         let title = self.app.page_title(self.files.is_dirty() || self.flushing.get());
         if title != self.title
