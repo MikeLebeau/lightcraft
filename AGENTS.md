@@ -19,6 +19,12 @@ LightCraft is a clean-room, open-source, pure-Rust photo library + non-destructi
    path the tracker cites still exists, and `cargo xtask parity --write` refreshes its summary.
 5. Follow the autonomous operation protocol (`plan/execution-plan.md` §7). Don't stop to ask unless §7 lists the decision as the user's.
 
+## Finish a testable step
+- When the user asks for implementation, keep working through to a concrete, usable milestone. Do not stop at a plan, partial wiring, or a status update when the requested workflow is still incomplete.
+- If the user asks a question or for status during active work, answer briefly and then resume the implementation unless they explicitly ask to stop or change direction.
+- Before saying a feature is ready for the user to try, build the runnable client and any changed service, make sure the exact workflow is connected end to end, and either exercise it or clearly state what could not be exercised. Give the user the exact restart/rebuild steps when their running copy needs updating.
+- Do not describe intended behavior as implemented. If a step is incomplete, keep going; if a real blocker prevents progress, name the specific missing dependency or decision and the smallest action needed to unblock it.
+
 `plan/` is gitignored (local-only).
 
 **Merging agent branches:** merge one branch, run `cargo xtask ci`, fix, commit — then the next. Two individually green
