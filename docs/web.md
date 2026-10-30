@@ -181,8 +181,9 @@ saved by the old page may then be lost. The server atomically replaces catalog f
 expected offsets when extending `catalog.log`. The page renews the lease while open and attempts
 to release it when closing; after a crash, the lease expires.
 This is single-editor access, not simultaneous editing or conflict merging. Remote rendering uses
-one Web Worker by default so RAW decode and develop work do not block the browser UI; `?workers=2`
-can be used to compare a second worker, and `?workers=0` disables them. The workers reuse the page's
+two Web Workers by default; `?workers=0` disables them and `?workers=1..4` selects a count. In the NAS
+Nginx container, `LIGHTCRAFT_REMOTE_URL` supplies the API base URL and query `?remote=` overrides
+it for a session. The workers reuse the page's
 lease and API credentials. If a lease renewal fails, a reconnect icon appears in the top bar. It
 retries the current lease and resumes saving only if that same lease is still valid; if it expired
 or another editor took over, the page remains frozen so it cannot overwrite newer catalog data.

@@ -34,6 +34,7 @@ fn accept_list() -> String {
 const SAVE_RETRY_MS: f64 = 2000.0;
 const LEASE_RENEW_AFTER_MS: f64 = 15_000.0;
 const LEASE_HEARTBEAT_INTERVAL_MS: i32 = 5_000;
+const MAX_WEB_WORKERS: usize = 4;
 
 /// How long a notice stays on screen (s).
 const NOTICE_SECS: f64 = 8.0;
@@ -204,12 +205,16 @@ impl Options {
             })
             .collect();
         let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let runtime = js_sys::Reflect::get(&js_sys::global(), &"lightcraftRuntimeConfig".into()).ok();
+        let runtime_get =
+            |key: &str| runtime.as_ref().and_then(|config| js_sys::Reflect::get(config, &key.into()).ok()).and_then(|value| value.as_string());
+        let workers_from = |value: Option<String>| value.and_then(|value| value.parse::<usize>().ok()).filter(|workers| *workers <= MAX_WEB_WORKERS);
         Options {
             bench: get("bench").is_some(),
             store: get("store").filter(|s| s == "idb" || s == "memory").unwrap_or_else(|| "opfs".into()),
-            workers: get("workers").and_then(|v| v.parse().ok()),
+            workers: workers_from(get("workers")).or_else(|| workers_from(runtime_get("workers"))),
             reset: get("reset").is_some(),
-            remote: get("remote").filter(|s| !s.trim().is_empty()),
+            remote: get("remote").filter(|s| !s.trim().is_empty()).or_else(|| runtime_get("remote").filter(|s| !s.trim().is_empty())),
         }
     }
 }
@@ -861,17 +866,7 @@ impl WebApp {
         }
         app.ui = app.ui.sanitized();
         app.library_problem = problem;
-        let remote = backend.as_ref().is_some_and(Backend::is_remote);
-        let n = opts.workers.unwrap_or_else(|| {
-            if remote {
-                // RAW decode and develop work can be large; keep one worker by default so it
-                // leaves CPU and memory headroom while keeping the UI responsive.
-                1
-            } else {
-                let cores = window().map_or(1, |w| w.navigator().hardware_concurrency() as usize);
-                cores.saturating_sub(1).clamp(1, 4)
-            }
-        });
+        let n = opts.workers.unwrap_or(2);
         let cache = app.session.media.rendered.clone();
         let worker_config = match backend.as_ref() {
             Some(backend) => backend.worker_config(),

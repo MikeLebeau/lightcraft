@@ -4,11 +4,17 @@ services:
     platform: linux/amd64
     container_name: lightcraft-web
     restart: unless-stopped
+    environment:
+      LIGHTCRAFT_REMOTE_URL: ${LIGHTCRAFT_REMOTE_URL:-}
+      LIGHTCRAFT_WEB_WORKERS: ${LIGHTCRAFT_WEB_WORKERS:-2}
+      NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/runtime-templates
+      NGINX_ENVSUBST_OUTPUT_DIR: /tmp/lightcraft-runtime
     ports:
       - "127.0.0.1:8080:80"
     volumes:
       - ${LIGHTCRAFT_WEB_SITE_PATH:?Set the NAS path to the built LightCraft web-site}:/usr/share/nginx/html:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./lightcraft-runtime.js.template:/etc/nginx/runtime-templates/lightcraft-runtime.js.template:ro
 
   lightcraft-library-server:
     # DS218+ is x86_64; keep images built on an ARM development machine compatible.

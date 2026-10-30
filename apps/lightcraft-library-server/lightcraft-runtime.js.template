@@ -1,0 +1,4 @@
+globalThis.lightcraftRuntimeConfig = {
+  remote: "${LIGHTCRAFT_REMOTE_URL}",
+  workers: "${LIGHTCRAFT_WEB_WORKERS}"
+};
