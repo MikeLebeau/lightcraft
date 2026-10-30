@@ -24,7 +24,7 @@ services:
       LIGHTCRAFT_DATA_DIR: /data
       LIGHTCRAFT_API_TOKEN: ${LIGHTCRAFT_API_TOKEN:?Set a private token of at least 32 characters}
       LIGHTCRAFT_ALLOWED_ORIGIN: ${LIGHTCRAFT_ALLOWED_ORIGIN:?Set the exact HTTPS origin serving LightCraft Web}
-      LIGHTCRAFT_LEASE_SECONDS: 45
+      LIGHTCRAFT_LEASE_SECONDS: ${LIGHTCRAFT_LEASE_SECONDS:-300}
     ports:
       - "127.0.0.1:8090:8090"
     volumes:

@@ -25,7 +25,7 @@ The initial API is deliberately small:
 - `PATCH` is restricted to `library/catalog.log` and requires `X-LightCraft-Offset`; stale offsets are rejected.
 - `GET /v1/list?path=<directory>` lists direct children.
 
-Writes are serialized, whole-file replacements use a temporary file and rename, originals are checked against LightCraft's content hash, and expired leases are rejected on every file operation. A lease is held in service memory and expires after 45 seconds by default; the client must renew it. Handoff requests are held in memory too: the active tab polls, blocks edits, flushes pending writes and acknowledges before the server transfers the lease. If it does not answer within 30 seconds, the requester is offered a warned forced takeover. A service restart invalidates the old lease and any pending request.
+Writes are serialized, whole-file replacements use a temporary file and rename, originals are checked against LightCraft's content hash, and expired leases are rejected on every file operation. A lease is held in service memory and expires after 300 seconds by default; the browser renews it every 15 seconds on a timer independent of UI rendering. This longer window also tolerates background-tab timer throttling. Handoff requests are held in memory too: the active tab polls, blocks edits, flushes pending writes and acknowledges before the server transfers the lease. If it does not answer within 30 seconds, the requester is offered a warned forced takeover. A service restart invalidates the old lease and any pending request.
 
 ## Docker / Synology
 
@@ -50,6 +50,6 @@ The mounted catalog directory must be writable by the server's unprivileged user
 
 The persistent bind mount is separate from the container image. Rebuilding or replacing the image does not replace the data directory. Use only disposable catalog and image data until the browser client, lease-loss handling, backup strategy, and NAS behavior have been exercised.
 
-For the local development pairing, run `cargo xtask web --serve`, then open `http://127.0.0.1:8080/?remote=http://127.0.0.1:8090`. The page prompts for the service token. For the NAS-hosted setup, open the frontend's HTTPS hostname with `?remote=https://<API-hostname>`. Remote rendering starts one Web Worker by default (`&workers=2` to compare two, `&workers=0` to disable); workers share the page's lease. A closed or crashed browser releases the lease explicitly when possible; the 45-second expiry is the fallback.
+For the local development pairing, run `cargo xtask web --serve`, then open `http://127.0.0.1:8080/?remote=http://127.0.0.1:8090`. The page prompts for the service token. For the NAS-hosted setup, open the frontend's HTTPS hostname with `?remote=https://<API-hostname>`. Remote rendering starts one Web Worker by default (`&workers=2` to compare two, `&workers=0` to disable); workers share the page's lease. A closed or crashed browser releases the lease explicitly when possible; the 300-second expiry is the fallback.
 
 This is an early PoC service, not a production backup or multi-user service. Use a disposable data directory until the browser flow and DSM deployment have been exercised.

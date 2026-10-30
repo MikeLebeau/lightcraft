@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8090";
 const DEFAULT_ORIGIN: &str = "http://127.0.0.1:8080";
-const DEFAULT_LEASE_SECONDS: u64 = 45;
+const DEFAULT_LEASE_SECONDS: u64 = 300;
 const MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 const LEASE_HEADER: HeaderName = HeaderName::from_static("x-lightcraft-lease");
 const OFFSET_HEADER: HeaderName = HeaderName::from_static("x-lightcraft-offset");

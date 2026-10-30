@@ -32,6 +32,8 @@ fn accept_list() -> String {
 
 /// After a failed save, wait this long before trying again (ms).
 const SAVE_RETRY_MS: f64 = 2000.0;
+const LEASE_RENEW_AFTER_MS: f64 = 15_000.0;
+const LEASE_HEARTBEAT_INTERVAL_MS: i32 = 5_000;
 
 /// How long a notice stays on screen (s).
 const NOTICE_SECS: f64 = 8.0;
@@ -95,6 +97,71 @@ fn release_remote_on_pagehide(backend: &Backend) {
     });
     if let Err(error) = window.add_event_listener_with_callback("pagehide", callback.as_ref().unchecked_ref()) {
         log::debug!("couldn't register shared-library lease release: {error:?}");
+    }
+    callback.forget();
+}
+
+fn queue_remote_lease_renewal(
+    backend: Backend,
+    files: Files,
+    frozen: Rc<Cell<bool>>,
+    disconnected: Rc<Cell<bool>>,
+    renewing: Rc<Cell<bool>>,
+    last_renew: Rc<Cell<f64>>,
+    handoff_busy: Rc<Cell<bool>>,
+    ctx: egui::Context,
+) {
+    if frozen.get() || handoff_busy.get() || renewing.get() || lightcraft_ui_egui::monotonic_ms() - last_renew.get() < LEASE_RENEW_AFTER_MS {
+        return;
+    }
+    renewing.set(true);
+    wasm_bindgen_futures::spawn_local(async move {
+        match backend.renew_lease().await {
+            Ok(()) => {
+                last_renew.set(lightcraft_ui_egui::monotonic_ms());
+                disconnected.set(false);
+            }
+            Err(error) => {
+                files.set_error(Some(format!("shared-library edit lease lost: {error}")));
+                frozen.set(true);
+                disconnected.set(true);
+                notice(
+                    "The shared-library edit lease was lost. Saving is stopped; reload only after the connection or other editor issue is resolved.",
+                );
+            }
+        }
+        renewing.set(false);
+        ctx.request_repaint();
+    });
+}
+
+/// Keep renewing the shared lease even when egui has no visible frames to process.
+fn start_remote_lease_heartbeat(
+    backend: Backend,
+    files: Files,
+    frozen: Rc<Cell<bool>>,
+    disconnected: Rc<Cell<bool>>,
+    renewing: Rc<Cell<bool>>,
+    last_renew: Rc<Cell<f64>>,
+    handoff_busy: Rc<Cell<bool>>,
+    ctx: egui::Context,
+) {
+    let Some(window) = window() else { return };
+    let callback = Closure::<dyn FnMut()>::new(move || {
+        queue_remote_lease_renewal(
+            backend.clone(),
+            files.clone(),
+            frozen.clone(),
+            disconnected.clone(),
+            renewing.clone(),
+            last_renew.clone(),
+            handoff_busy.clone(),
+            ctx.clone(),
+        );
+    });
+    if let Err(error) = window.set_interval_with_callback_and_timeout_and_arguments_0(callback.as_ref().unchecked_ref(), LEASE_HEARTBEAT_INTERVAL_MS)
+    {
+        log::warn!("couldn't start shared-library lease heartbeat: {error:?}");
     }
     callback.forget();
 }
@@ -748,13 +815,27 @@ impl WebApp {
         session.media.preview_capacity = 3;
         // nothing is saved while the stored library couldn't be read
         let frozen = Rc::new(Cell::new(read_failed));
-        let last_lease_renew = Rc::new(Cell::new(lightcraft_ui_egui::monotonic_ms()));
+        // The lease may have spent time loading the library before the UI was constructed.
+        // Renew immediately instead of treating app construction as a successful heartbeat.
+        let last_lease_renew = Rc::new(Cell::new(lightcraft_ui_egui::monotonic_ms() - LEASE_RENEW_AFTER_MS));
         let lease_renewing = Rc::new(Cell::new(false));
         let remote_disconnected = Rc::new(Cell::new(false));
         let handoff_busy = Rc::new(Cell::new(false));
         let takeback_busy = Rc::new(Cell::new(false));
         let takeback_deadline = Rc::new(Cell::new(0.0));
         let last_handoff_check = Rc::new(Cell::new(0.0));
+        if let Some(backend) = backend.as_ref().filter(|backend| backend.is_remote()) {
+            start_remote_lease_heartbeat(
+                backend.clone(),
+                files.clone(),
+                frozen.clone(),
+                remote_disconnected.clone(),
+                lease_renewing.clone(),
+                last_lease_renew.clone(),
+                handoff_busy.clone(),
+                cc.egui_ctx.clone(),
+            );
+        }
         let mut app = LightcraftApp::new(
             session,
             services(
@@ -952,41 +1033,16 @@ impl WebApp {
 
     fn renew_remote_lease(&mut self, ctx: &egui::Context) {
         let Some(backend) = self.backend.as_ref().filter(|b| b.is_remote()) else { return };
-        if self.frozen.get() || self.lease_renewing.get() || self.handoff_busy.get() {
-            return;
-        }
-        let now = lightcraft_ui_egui::monotonic_ms();
-        if now - self.last_lease_renew.get() < 15_000.0 {
-            return;
-        }
-        self.lease_renewing.set(true);
-        let (backend, files, frozen, disconnected, renewing, last_renew, ctx) = (
+        queue_remote_lease_renewal(
             backend.clone(),
             self.files.clone(),
             self.frozen.clone(),
             self.remote_disconnected.clone(),
             self.lease_renewing.clone(),
             self.last_lease_renew.clone(),
+            self.handoff_busy.clone(),
             ctx.clone(),
         );
-        wasm_bindgen_futures::spawn_local(async move {
-            match backend.renew_lease().await {
-                Ok(()) => {
-                    last_renew.set(lightcraft_ui_egui::monotonic_ms());
-                    disconnected.set(false);
-                }
-                Err(error) => {
-                    files.set_error(Some(format!("shared-library edit lease lost: {error}")));
-                    frozen.set(true);
-                    disconnected.set(true);
-                    notice(
-                        "The shared-library edit lease was lost. Saving is stopped; reload only after the connection or other editor issue is resolved.",
-                    );
-                }
-            }
-            renewing.set(false);
-            ctx.request_repaint();
-        });
     }
 
     fn poll_remote_handoff(&mut self, ctx: &egui::Context) {
