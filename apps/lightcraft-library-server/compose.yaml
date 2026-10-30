@@ -1,4 +1,15 @@
 services:
+  lightcraft-web:
+    image: nginx:alpine
+    platform: linux/amd64
+    container_name: lightcraft-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ${LIGHTCRAFT_WEB_SITE_PATH:?Set the NAS path to the built LightCraft web-site}:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
   lightcraft-library-server:
     # DS218+ is x86_64; keep images built on an ARM development machine compatible.
     platform: linux/amd64
