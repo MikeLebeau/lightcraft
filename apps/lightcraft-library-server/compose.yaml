@@ -8,7 +8,7 @@ services:
       LIGHTCRAFT_REMOTE_URL: ${LIGHTCRAFT_REMOTE_URL:-}
       LIGHTCRAFT_WEB_WORKERS: ${LIGHTCRAFT_WEB_WORKERS:-2}
       NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/runtime-templates
-      NGINX_ENVSUBST_OUTPUT_DIR: /tmp/lightcraft-runtime
+      NGINX_ENVSUBST_OUTPUT_DIR: /tmp
     ports:
       - "127.0.0.1:8080:80"
     volumes:
